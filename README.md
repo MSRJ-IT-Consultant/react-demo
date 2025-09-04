@@ -6,7 +6,7 @@ The app only displays text and a counter button, but it is fully prepared for **
 ---
 
 ## 📦 Tech Stack
-- [React 18](https://react.dev/) – Frontend library
+- [React 22](https://react.dev/) – Frontend library
 - [Vite](https://vitejs.dev/) – Build tool
 - [Docker](https://www.docker.com/) – Containerization
 - [Nginx](https://nginx.org/) – Web server for static files
