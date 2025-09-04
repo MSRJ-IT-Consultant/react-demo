@@ -7,7 +7,7 @@ function App() {
   return (
     <div className="app">
       <h1>Hello DevSecOps World 🚀</h1>
-      <p>GitLab CI msrj.xyz@gmail.com</p>
+      <p>GitHub Actions msrj.xyz@gmail.com</p>
 
       <div className="card">
         <button onClick={() => setCount(count + 1)}>
