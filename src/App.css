@@ -1,0 +1,52 @@
+html, body, #root {
+  height: 100%;
+  width: 100%;      /* pastikan penuh layar */
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: #f9f9f9;
+  font-family: Arial, sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;   /* center secara vertikal */
+  align-items: center;       /* center secara horizontal */
+  height: 100%;
+  width: 100%;
+  text-align: center;
+}
+
+h1 {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin: 0;
+  color: #111;
+}
+
+p {
+  font-size: 1.2rem;
+  margin: 10px 0;
+  color: #333;
+}
+
+.card {
+  margin-top: 20px;
+}
+
+button {
+  background-color: #242424;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+button:hover {
+  background-color: #444;
+}

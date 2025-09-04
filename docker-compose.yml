@@ -1,0 +1,7 @@
+services:
+  demo-react:
+    build: .
+    container_name: demo-react
+    ports:
+      - "8080:80"
+    restart: unless-stopped

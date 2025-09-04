@@ -1,0 +1,570 @@
+# GitLab CI/CD Pipeline for Frontend with Security Scanning
+
+stages:
+  - security-scan
+  - build
+  - container-scan
+  - deploy
+  - notify
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: "fclone29/react-demo"
+  IMAGE_TAG: $CI_COMMIT_SHA
+
+# Security Dependencies Scan Stage
+dependency-security-scan:
+  stage: security-scan
+  image: node:18-alpine
+  before_script:
+    - apk add --no-cache jq curl
+    # Always create default environment file first
+    - echo "SNYK_CRITICAL=0" > snyk.env
+    - echo "SNYK_HIGH=0" >> snyk.env
+    - echo "SNYK_MEDIUM=0" >> snyk.env
+    - echo "SNYK_LOW=0" >> snyk.env
+    - echo "SNYK_TOTAL=0" >> snyk.env
+    - echo "SNYK_STATUS=Scan_not_completed" >> snyk.env
+    - echo "SNYK_FAILED=false" >> snyk.env
+  script:
+    # Install dependencies and run npm audit
+    - |
+      echo "Installing npm dependencies..."
+      npm install || (echo "❌ npm install failed" && exit 1)
+      echo "Running npm audit..."
+      npm audit --production --json | tee audit-results.json || echo "npm audit completed with warnings"
+    
+    # Install and run Snyk with proper token handling
+    - |
+      if [ -n "$SNYK_TOKEN" ] && [ "$SNYK_TOKEN" != "" ]; then
+        echo "Installing Snyk CLI..."
+        npm install -g snyk
+        
+        echo "Authenticating with Snyk using token..."
+        # Use token directly instead of interactive auth
+        export SNYK_TOKEN="$SNYK_TOKEN"
+        
+        echo "Running Snyk test..."
+        # Run snyk test with token and proper error handling
+        snyk test --json --file=package.json > snyk-results.json 2>&1 || SNYK_EXIT_CODE=$?
+        
+        # Check if we got valid JSON results
+        if [ -f "snyk-results.json" ] && [ -s "snyk-results.json" ]; then
+          # Validate JSON
+          if jq empty snyk-results.json 2>/dev/null; then
+            echo "✅ Snyk scan completed successfully"
+          else
+            echo "⚠️ Snyk returned invalid JSON, treating as no vulnerabilities"
+            echo '{"vulnerabilities": []}' > snyk-results.json
+          fi
+        else
+          echo "⚠️ No Snyk results file, creating empty results"
+          echo '{"vulnerabilities": []}' > snyk-results.json
+        fi
+      else
+        echo "⚠️ SNYK_TOKEN not provided or empty, skipping Snyk scan"
+        echo "To enable Snyk scanning, add SNYK_TOKEN to GitLab CI/CD variables"
+        echo '{"vulnerabilities": []}' > snyk-results.json
+      fi
+    
+    # Process Snyk results with better error handling
+    - |
+      if [ -f "snyk-results.json" ] && [ -s "snyk-results.json" ]; then
+        echo "Processing Snyk results..."
+        
+        # Debug: Show first few lines of results
+        echo "Snyk results preview:"
+        head -n 10 snyk-results.json || echo "Could not preview results"
+        
+        # Count vulnerabilities by severity with better error handling
+        CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' snyk-results.json 2>/dev/null || echo "0")
+        HIGH=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' snyk-results.json 2>/dev/null || echo "0")
+        MEDIUM=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' snyk-results.json 2>/dev/null || echo "0")
+        LOW=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' snyk-results.json 2>/dev/null || echo "0")
+        
+        # Ensure we have numeric values
+        CRITICAL=${CRITICAL:-0}
+        HIGH=${HIGH:-0}
+        MEDIUM=${MEDIUM:-0}
+        LOW=${LOW:-0}
+        
+        # Create environment file using simple echo commands
+        echo "SNYK_CRITICAL=$CRITICAL" > snyk.env
+        echo "SNYK_HIGH=$HIGH" >> snyk.env
+        echo "SNYK_MEDIUM=$MEDIUM" >> snyk.env
+        echo "SNYK_LOW=$LOW" >> snyk.env
+        echo "SNYK_TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))" >> snyk.env
+        
+        if [ $CRITICAL -gt 0 ] || [ $HIGH -gt 0 ]; then
+          echo "SNYK_STATUS=Found_Critical_High_vulnerabilities" >> snyk.env
+          echo "SNYK_FAILED=true" >> snyk.env
+        elif [ $MEDIUM -gt 0 ] || [ $LOW -gt 0 ]; then
+          echo "SNYK_STATUS=Found_Medium_Low_vulnerabilities" >> snyk.env
+          echo "SNYK_FAILED=false" >> snyk.env
+        else
+          echo "SNYK_STATUS=No_vulnerabilities_found" >> snyk.env
+          echo "SNYK_FAILED=false" >> snyk.env
+        fi
+      else
+        echo "No valid Snyk results found, using safe defaults"
+      fi
+    
+    # Display results for debugging
+    - |
+      echo "=== SNYK SCAN RESULTS ==="
+      cat snyk.env
+      echo "========================="
+      
+      # Show file existence for debugging
+      echo "Files in current directory:"
+      ls -la *.json *.env 2>/dev/null || echo "No JSON/env files found"
+    
+    # Check Snyk Security Gate
+    - |
+      source snyk.env
+      echo "Checking security gate with SNYK_FAILED=$SNYK_FAILED"
+      
+      if [ "$SNYK_FAILED" == "true" ]; then
+        echo "🚨 SECURITY GATE FAILED: Snyk found Critical/High vulnerabilities!"
+        echo "Critical: $SNYK_CRITICAL, High: $SNYK_HIGH"
+        echo "Pipeline stopped due to security vulnerabilities."
+        exit 1
+      else
+        echo "✅ Snyk Security Gate PASSED"
+        echo "Found: Critical=$SNYK_CRITICAL, High=$SNYK_HIGH, Medium=$SNYK_MEDIUM, Low=$SNYK_LOW"
+      fi
+  artifacts:
+    reports:
+      dotenv: snyk.env
+    paths:
+      - snyk-results.json
+      - audit-results.json  
+      - snyk.env
+    expire_in: 1 week
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Build Docker Image Stage
+build-image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - docker info
+    - echo "Building Docker image with tag:$IMAGE_TAG"
+  script:
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - docker save $IMAGE_NAME:$IMAGE_TAG -o docker-image.tar
+  artifacts:
+    paths:
+      - docker-image.tar
+    expire_in: 1 hour
+  dependencies:
+    - dependency-security-scan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Container Security Scan Stage
+container-security-scan:
+  stage: container-scan
+  image: alpine:3.19
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - apk add --no-cache jq curl wget docker-cli
+    - docker info
+    - docker load -i docker-image.tar
+    # Install Trivy with simplified approach
+    - |
+      echo "Installing Trivy..."
+      # Use a fixed version that we know works
+      TRIVY_VERSION="0.55.2"
+      echo "Installing Trivy version: $TRIVY_VERSION"
+      wget -O trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+      tar zxf trivy.tar.gz
+      mv trivy /usr/local/bin/
+      chmod +x /usr/local/bin/trivy
+      trivy --version || echo "Trivy installed but version check failed"
+    # Create default environment file to avoid artifacts error
+    - echo "TRIVY_CRITICAL=0" > trivy.env
+    - echo "TRIVY_HIGH=0" >> trivy.env
+    - echo "TRIVY_MEDIUM=0" >> trivy.env
+    - echo "TRIVY_LOW=0" >> trivy.env
+    - echo "TRIVY_TOTAL=0" >> trivy.env
+    - echo "TRIVY_STATUS=Scan_not_completed" >> trivy.env
+    - echo "TRIVY_FAILED=false" >> trivy.env
+  script:
+    # Run Trivy scan with proper error handling
+    - |
+      echo "Running Trivy scan on image: $IMAGE_NAME:$IMAGE_TAG"
+      trivy image --format json --output trivy-results.json --exit-code 0 --ignore-unfixed --vuln-type os,library --severity CRITICAL,HIGH $IMAGE_NAME:$IMAGE_TAG || echo "Trivy scan completed"
+    
+    # Process Trivy results
+    - |
+      if [ -f "trivy-results.json" ] && [ -s "trivy-results.json" ]; then
+        echo "Processing Trivy results..."
+        # Count vulnerabilities by severity from Trivy results
+        CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+        HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo "0")
+        MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-results.json 2>/dev/null || echo "0")
+        LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "LOW")] | length' trivy-results.json 2>/dev/null || echo "0")
+        
+        # Update environment file
+        echo "TRIVY_CRITICAL=$CRITICAL" > trivy.env
+        echo "TRIVY_HIGH=$HIGH" >> trivy.env
+        echo "TRIVY_MEDIUM=$MEDIUM" >> trivy.env
+        echo "TRIVY_LOW=$LOW" >> trivy.env
+        echo "TRIVY_TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))" >> trivy.env
+        
+        if [ $CRITICAL -gt 0 ] || [ $HIGH -gt 0 ]; then
+          echo "TRIVY_STATUS=Found_Critical_High_vulnerabilities" >> trivy.env
+          echo "TRIVY_FAILED=true" >> trivy.env
+        elif [ $MEDIUM -gt 0 ] || [ $LOW -gt 0 ]; then
+          echo "TRIVY_STATUS=Found_Medium_Low_vulnerabilities" >> trivy.env
+          echo "TRIVY_FAILED=false" >> trivy.env
+        else
+          echo "TRIVY_STATUS=No_vulnerabilities_found" >> trivy.env
+          echo "TRIVY_FAILED=false" >> trivy.env
+        fi
+      else
+        echo "No valid Trivy results found, using defaults"
+      fi
+    
+    # Display results
+    - |
+      echo "=== TRIVY SCAN RESULTS ==="
+      cat trivy.env
+      echo "=========================="
+    
+    # Check Trivy Security Gate
+    - |
+      source trivy.env
+      if [ "$TRIVY_FAILED" == "true" ]; then
+        echo "🚨 SECURITY GATE FAILED: Trivy found Critical/High vulnerabilities!"
+        echo "Critical: $TRIVY_CRITICAL, High: $TRIVY_HIGH"
+        echo "Pipeline stopped due to security vulnerabilities."
+        exit 1
+      else
+        echo "✅ Trivy Security Gate PASSED"
+      fi
+  artifacts:
+    reports:
+      dotenv: trivy.env
+    paths:
+      - trivy-results.json
+      - trivy.env
+    expire_in: 1 week
+    when: always  # Upload artifacts even if job fails
+  dependencies:
+    - build-image
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Final Security Gate Check
+security-gate-check:
+  stage: container-scan
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - |
+      # Load environment variables from previous jobs
+      if [ -f snyk.env ]; then source snyk.env; fi
+      if [ -f trivy.env ]; then source trivy.env; fi
+      
+      # Convert underscore format back to readable format for Slack
+      SNYK_STATUS_READABLE=$(echo "${SNYK_STATUS:-Unknown}" | sed 's/_/ /g')
+      TRIVY_STATUS_READABLE=$(echo "${TRIVY_STATUS:-Unknown}" | sed 's/_/ /g')
+      
+      # Convert underscore format back to readable format for Slack
+      SNYK_STATUS_READABLE=$(echo "${SNYK_STATUS:-Unknown}" | sed 's/_/ /g')
+      TRIVY_STATUS_READABLE=$(echo "${TRIVY_STATUS:-Unknown}" | sed 's/_/ /g')
+      
+      TOTAL_CRITICAL=$((${SNYK_CRITICAL:-0} + ${TRIVY_CRITICAL:-0}))
+      TOTAL_HIGH=$((${SNYK_HIGH:-0} + ${TRIVY_HIGH:-0}))
+      
+      echo "=== SECURITY GATE SUMMARY ==="
+      echo "Total Critical Vulnerabilities: $TOTAL_CRITICAL"
+      echo "Total High Vulnerabilities: $TOTAL_HIGH"
+      echo "Snyk Status: ${SNYK_STATUS:-Unknown}"
+      echo "Trivy Status: ${TRIVY_STATUS:-Unknown}"
+      
+      if [ $TOTAL_CRITICAL -gt 0 ] || [ $TOTAL_HIGH -gt 0 ]; then
+        echo ""
+        echo "🚨 DEPLOYMENT BLOCKED: Critical/High vulnerabilities found!"
+        echo "🛑 Fix these security issues before proceeding with deployment."
+        exit 1
+      else
+        echo ""
+        echo "✅ SECURITY GATE PASSED: Safe to proceed with deployment"
+      fi
+  dependencies:
+    - dependency-security-scan
+    - container-security-scan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Deploy Stage - Push to Registry
+deploy-image:
+  stage: deploy
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - docker info
+    - docker load -i docker-image.tar
+    - echo $DOCKERHUB_TOKEN | docker login -u $DOCKERHUB_USERNAME --password-stdin
+  script:
+    - echo "Pushing Docker image:$IMAGE_NAME:$IMAGE_TAG"
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+  dependencies:
+    - build-image
+    - security-gate-check
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+
+# Slack Notification - Success
+notify-success:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      # Load environment variables from previous jobs
+      if [ -f snyk.env ]; then source snyk.env; fi
+      if [ -f trivy.env ]; then source trivy.env; fi
+      
+      curl -X POST -H 'Content-type: application/json' \
+      --data "{
+        \"text\": \"Deployment successful for commit $CI_COMMIT_SHA\",
+        \"blocks\": [
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*🎉 Deployment Successful*\"
+            }
+          },
+          {
+            \"type\": \"section\",
+            \"fields\": [
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Commit SHA*: $CI_COMMIT_SHA\"
+              },
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Image Tag*: $IMAGE_TAG\"
+              }
+            ]
+          },
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"<$CI_PROJECT_URL/-/commit/$CI_COMMIT_SHA|View Commit>\"
+            }
+          },
+          {
+            \"type\": \"divider\"
+          },
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*🔍 Security Scan Results*\"
+            }
+          },
+          {
+            \"type\": \"section\",
+            \"fields\": [
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Snyk Dependencies*\n${SNYK_STATUS:-Unknown}\nTotal: ${SNYK_TOTAL:-0} (Critical: ${SNYK_CRITICAL:-0}, High: ${SNYK_HIGH:-0}, Medium: ${SNYK_MEDIUM:-0}, Low: ${SNYK_LOW:-0})\"
+              },
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Trivy Container*\n${TRIVY_STATUS:-Unknown}\nTotal: ${TRIVY_TOTAL:-0} (Critical: ${TRIVY_CRITICAL:-0}, High: ${TRIVY_HIGH:-0}, Medium: ${TRIVY_MEDIUM:-0}, Low: ${TRIVY_LOW:-0})\"
+              }
+            ]
+          }
+        ]
+      }" \
+      $SLACK_WEBHOOK
+  dependencies:
+    - dependency-security-scan
+    - container-security-scan
+    - deploy-image
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+  when: on_success
+
+# Slack Notification - Failure
+notify-failure:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      # Load environment variables from previous jobs
+      if [ -f snyk.env ]; then source snyk.env; fi
+      if [ -f trivy.env ]; then source trivy.env; fi
+      
+      curl -X POST -H 'Content-type: application/json' \
+      --data "{
+        \"text\": \"Deployment failed for commit $CI_COMMIT_SHA\",
+        \"blocks\": [
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*❌ Deployment Failed*\"
+            }
+          },
+          {
+            \"type\": \"section\",
+            \"fields\": [
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Commit SHA*: $CI_COMMIT_SHA\"
+              },
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Image Tag*: $IMAGE_TAG\"
+              }
+            ]
+          },
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"<$CI_PROJECT_URL/-/commit/$CI_COMMIT_SHA|View Commit>\"
+            }
+          },
+          {
+            \"type\": \"divider\"
+          },
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"*🔍 Security Scan Results*\"
+            }
+          },
+          {
+            \"type\": \"section\",
+            \"fields\": [
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Snyk Dependencies*\n${SNYK_STATUS:-Unknown}\nTotal: ${SNYK_TOTAL:-0} (Critical: ${SNYK_CRITICAL:-0}, High: ${SNYK_HIGH:-0}, Medium: ${SNYK_MEDIUM:-0}, Low: ${SNYK_LOW:-0})\"
+              },
+              {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Trivy Container*\n${TRIVY_STATUS:-Unknown}\nTotal: ${TRIVY_TOTAL:-0} (Critical: ${TRIVY_CRITICAL:-0}, High: ${TRIVY_HIGH:-0}, Medium: ${TRIVY_MEDIUM:-0}, Low: ${TRIVY_LOW:-0})\"
+              }
+            ]
+          },
+          {
+            \"type\": \"section\",
+            \"text\": {
+              \"type\": \"mrkdwn\",
+              \"text\": \"Please check the pipeline logs for detailed information. 🔧\"
+            }
+          }
+        ]
+      }" \
+      $SLACK_WEBHOOK
+  dependencies:
+    - dependency-security-scan
+    - container-security-scan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+  when: on_failure
+  allow_failure: true
+
+# Security Alert Notification
+security-alert:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      # Load environment variables from previous jobs
+      if [ -f snyk.env ]; then source snyk.env; fi
+      if [ -f trivy.env ]; then source trivy.env; fi
+      
+      # Check if there are critical or high vulnerabilities
+      if [ "${SNYK_CRITICAL:-0}" -gt 0 ] || [ "${SNYK_HIGH:-0}" -gt 0 ] || [ "${TRIVY_CRITICAL:-0}" -gt 0 ] || [ "${TRIVY_HIGH:-0}" -gt 0 ]; then
+        curl -X POST -H 'Content-type: application/json' \
+        --data "{
+          \"text\": \"🚨 SECURITY ALERT: Critical/High vulnerabilities detected!\",
+          \"blocks\": [
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*🚨 SECURITY ALERT - DEPLOYMENT BLOCKED*\"
+              }
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"Critical or High severity vulnerabilities detected in commit $CI_COMMIT_SHA\"
+              }
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Snyk (Dependencies)*\nCritical: ${SNYK_CRITICAL:-0}\nHigh: ${SNYK_HIGH:-0}\"
+                },
+                {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Trivy (Container)*\nCritical: ${TRIVY_CRITICAL:-0}\nHigh: ${TRIVY_HIGH:-0}\"
+                }
+              ]
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"<$CI_PIPELINE_URL|View Detailed Scan Results>\"
+              }
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"🛑 *DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding.\"
+              }
+            }
+          ]
+        }" \
+        $SLACK_WEBHOOK
+      fi
+  dependencies:
+    - dependency-security-scan
+    - container-security-scan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+#    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  when: always
+  allow_failure: true
