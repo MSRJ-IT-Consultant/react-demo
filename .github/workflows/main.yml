@@ -201,6 +201,26 @@ jobs:
             echo "✅ SECURITY GATE PASSED: Safe to proceed with deployment"
           fi
 
+      # Generate SBOM
+      - name: Generate SBOM (Syft)
+        uses: anchore/syft-action@v0.15.0
+        with:
+          image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+          format: cyclonedx-json
+          output: sbom.json
+
+      # Upload scan artifacts for audit trail
+      - name: Upload All Scan Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            snyk-results.json
+            trivy-results.json
+            audit-results.json
+            sbom.json
+
       # Authenticate to Google Cloud (only if security gates pass)
       - name: Authenticate to Google Cloud
         if: success()
