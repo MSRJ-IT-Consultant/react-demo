@@ -15,8 +15,23 @@ env:
   REPOSITORY: sb-repository
   
 jobs:
-  build:
+  security-scan:
+    name: Security Scan & Build
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.set_image_tag.outputs.IMAGE_TAG }}
+      snyk-status: ${{ env.SNYK_STATUS }}
+      snyk-total: ${{ env.SNYK_TOTAL }}
+      snyk-critical: ${{ env.SNYK_CRITICAL }}
+      snyk-high: ${{ env.SNYK_HIGH }}
+      snyk-medium: ${{ env.SNYK_MEDIUM }}
+      snyk-low: ${{ env.SNYK_LOW }}
+      trivy-status: ${{ env.TRIVY_STATUS }}
+      trivy-total: ${{ env.TRIVY_TOTAL }}
+      trivy-critical: ${{ env.TRIVY_CRITICAL }}
+      trivy-high: ${{ env.TRIVY_HIGH }}
+      trivy-medium: ${{ env.TRIVY_MEDIUM }}
+      trivy-low: ${{ env.TRIVY_LOW }}
 
     steps:
       # Checkout source code
@@ -107,6 +122,7 @@ jobs:
         run: |
           IMAGE_TAG="${{ github.sha }}"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
           echo "Generated IMAGE_TAG: $IMAGE_TAG"
 
       # Build Docker image with commit SHA as tag
@@ -243,12 +259,75 @@ jobs:
               ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
             docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
 
-      # Deploy to Cloud Run (only if security gates pass)
+      # Send Security Alert to Slack if Critical/High vulnerabilities found
+      - name: Send Security Alert to Slack
+        if: always() && (env.SNYK_CRITICAL > 0 || env.SNYK_HIGH > 0 || env.TRIVY_CRITICAL > 0 || env.TRIVY_HIGH > 0)
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "🚨 SECURITY ALERT: Critical/High vulnerabilities detected!"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*🚨 SECURITY ALERT - GCP DEPLOYMENT BLOCKED*"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "Critical or High severity vulnerabilities detected in commit ${{ github.sha }}"
+              - type: "section"
+                fields:
+                  - type: "mrkdwn"
+                    text: "*Snyk (Dependencies)*\nCritical: ${{ env.SNYK_CRITICAL }}\nHigh: ${{ env.SNYK_HIGH }}"
+                  - type: "mrkdwn"
+                    text: "*Trivy (Container)*\nCritical: ${{ env.TRIVY_CRITICAL }}\nHigh: ${{ env.TRIVY_HIGH }}"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Detailed Scan Results>"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "🛑 *GCP DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding."
+
+  deploy:
+    name: Deploy to GCP
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: success()
+    environment: production
+    
+    steps:
+      # Checkout source code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download scan results artifact
+      - name: Download Security Scan Results
+        uses: actions/download-artifact@v4
+        with:
+          name: security-scan-results
+          path: ./scan-results
+
+      # Authenticate to Google Cloud
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Set up Cloud SDK
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Deploy to Cloud Run
       - name: Deploy to Cloud Run
-        if: success()
         run: |
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ needs.security-scan.outputs.image-tag }} \
             --region=${{ env.REGION }} \
             --platform=managed \
             --allow-unauthenticated \
@@ -260,13 +339,12 @@ jobs:
             --min-instances=0 \
             --timeout=300 \
             --set-env-vars="NODE_ENV=production" \
-            --labels="environment=production,version=${{ env.IMAGE_TAG }},deployed-by=github-actions" \
-            --revision-suffix="${{ env.IMAGE_TAG }}" \
+            --labels="environment=production,version=${{ needs.security-scan.outputs.image-tag }},deployed-by=github-actions" \
+            --revision-suffix="${{ needs.security-scan.outputs.image-tag }}" \
             --quiet
 
       # Get Cloud Run service URL
       - name: Get Service URL
-        if: success()
         run: |
           SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region=${{ env.REGION }} \
@@ -276,7 +354,6 @@ jobs:
 
       # Health Check
       - name: Health Check
-        if: success()
         run: |
           echo "Performing health check on ${{ env.SERVICE_URL }}"
           
@@ -321,7 +398,7 @@ jobs:
                   - type: "mrkdwn"
                     text: "*Commit SHA*: ${{ github.sha }}"
                   - type: "mrkdwn"
-                    text: "*Image Tag*: ${{ env.IMAGE_TAG }}"
+                    text: "*Image Tag*: ${{ needs.security-scan.outputs.image-tag }}"
                   - type: "mrkdwn"
                     text: "*Service URL*: ${{ env.SERVICE_URL }}"
                   - type: "mrkdwn"
@@ -338,9 +415,9 @@ jobs:
               - type: "section"
                 fields:
                   - type: "mrkdwn"
-                    text: "*Snyk Dependencies*\n${{ env.SNYK_STATUS }}\nTotal: ${{ env.SNYK_TOTAL }} (Critical: ${{ env.SNYK_CRITICAL }}, High: ${{ env.SNYK_HIGH }}, Medium: ${{ env.SNYK_MEDIUM }}, Low: ${{ env.SNYK_LOW }})"
+                    text: "*Snyk Dependencies*\n${{ needs.security-scan.outputs.snyk-status }}\nTotal: ${{ needs.security-scan.outputs.snyk-total }} (Critical: ${{ needs.security-scan.outputs.snyk-critical }}, High: ${{ needs.security-scan.outputs.snyk-high }}, Medium: ${{ needs.security-scan.outputs.snyk-medium }}, Low: ${{ needs.security-scan.outputs.snyk-low }})"
                   - type: "mrkdwn"
-                    text: "*Trivy Container*\n${{ env.TRIVY_STATUS }}\nTotal: ${{ env.TRIVY_TOTAL }} (Critical: ${{ env.TRIVY_CRITICAL }}, High: ${{ env.TRIVY_HIGH }}, Medium: ${{ env.TRIVY_MEDIUM }}, Low: ${{ env.TRIVY_LOW }})"
+                    text: "*Trivy Container*\n${{ needs.security-scan.outputs.trivy-status }}\nTotal: ${{ needs.security-scan.outputs.trivy-total }} (Critical: ${{ needs.security-scan.outputs.trivy-critical }}, High: ${{ needs.security-scan.outputs.trivy-high }}, Medium: ${{ needs.security-scan.outputs.trivy-medium }}, Low: ${{ needs.security-scan.outputs.trivy-low }})"
               - type: "section"
                 fields:
                   - type: "mrkdwn"
@@ -367,7 +444,7 @@ jobs:
                   - type: "mrkdwn"
                     text: "*Commit SHA*: ${{ github.sha }}"
                   - type: "mrkdwn"
-                    text: "*Image Tag*: ${{ env.IMAGE_TAG }}"
+                    text: "*Image Tag*: ${{ needs.security-scan.outputs.image-tag }}"
               - type: "section"
                 text:
                   type: "mrkdwn"
@@ -380,43 +457,10 @@ jobs:
               - type: "section"
                 fields:
                   - type: "mrkdwn"
-                    text: "*Snyk Dependencies*\n${{ env.SNYK_STATUS }}\nTotal: ${{ env.SNYK_TOTAL }} (Critical: ${{ env.SNYK_CRITICAL }}, High: ${{ env.SNYK_HIGH }}, Medium: ${{ env.SNYK_MEDIUM }}, Low: ${{ env.SNYK_LOW }})"
+                    text: "*Snyk Dependencies*\n${{ needs.security-scan.outputs.snyk-status }}\nTotal: ${{ needs.security-scan.outputs.snyk-total }} (Critical: ${{ needs.security-scan.outputs.snyk-critical }}, High: ${{ needs.security-scan.outputs.snyk-high }}, Medium: ${{ needs.security-scan.outputs.snyk-medium }}, Low: ${{ needs.security-scan.outputs.snyk-low }})"
                   - type: "mrkdwn"
-                    text: "*Trivy Container*\n${{ env.TRIVY_STATUS }}\nTotal: ${{ env.TRIVY_TOTAL }} (Critical: ${{ env.TRIVY_CRITICAL }}, High: ${{ env.TRIVY_HIGH }}, Medium: ${{ env.TRIVY_MEDIUM }}, Low: ${{ env.TRIVY_LOW }})"
+                    text: "*Trivy Container*\n${{ needs.security-scan.outputs.trivy-status }}\nTotal: ${{ needs.security-scan.outputs.trivy-total }} (Critical: ${{ needs.security-scan.outputs.trivy-critical }}, High: ${{ needs.security-scan.outputs.trivy-high }}, Medium: ${{ needs.security-scan.outputs.trivy-medium }}, Low: ${{ needs.security-scan.outputs.trivy-low }})"
               - type: "section"
                 text:
                   type: "mrkdwn"
                   text: "Please check the workflow logs for detailed information. 🔧"
-
-      # Send Security Alert to Slack if Critical/High vulnerabilities found
-      - name: Send Security Alert to Slack
-        if: always() && (env.SNYK_CRITICAL > 0 || env.SNYK_HIGH > 0 || env.TRIVY_CRITICAL > 0 || env.TRIVY_HIGH > 0)
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          webhook: ${{ secrets.SLACK_WEBHOOK }}
-          webhook-type: incoming-webhook
-          payload: |
-            text: "🚨 SECURITY ALERT: Critical/High vulnerabilities detected!"
-            blocks:
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "*🚨 SECURITY ALERT - GCP DEPLOYMENT BLOCKED*"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "Critical or High severity vulnerabilities detected in commit ${{ github.sha }}"
-              - type: "section"
-                fields:
-                  - type: "mrkdwn"
-                    text: "*Snyk (Dependencies)*\nCritical: ${{ env.SNYK_CRITICAL }}\nHigh: ${{ env.SNYK_HIGH }}"
-                  - type: "mrkdwn"
-                    text: "*Trivy (Container)*\nCritical: ${{ env.TRIVY_CRITICAL }}\nHigh: ${{ env.TRIVY_HIGH }}"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Detailed Scan Results>"
-              - type: "section"
-                text:
-                  type: "mrkdwn"
-                  text: "🛑 *GCP DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding."
