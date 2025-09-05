@@ -132,7 +132,7 @@ jobs:
             echo "Building Docker image with tag: $IMAGE_TAG"  
             docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:$IMAGE_TAG .
 
-      # Run Trivy Security scan on Docker image (updated version)
+      # Run Trivy Security scan on Docker image 
       - name: Scan Docker image with Trivy for vulnerabilities
         id: trivy_scan
         uses: aquasecurity/trivy-action@0.28.0 
