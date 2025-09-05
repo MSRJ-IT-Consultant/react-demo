@@ -1,4 +1,4 @@
-name: GitHub Actions for Frontend with GCP Deployment
+name: GitHub Actions for Frontend
 
 on:
   push:
@@ -8,12 +8,6 @@ on:
     branches:
       - master
 
-env:
-  PROJECT_ID: production-469102
-  REGION: asia-southeast1
-  SERVICE_NAME: react-demo-app
-  REPOSITORY: sb-repository
-  
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,11 +15,11 @@ jobs:
     steps:
       # Checkout source code
       - name: Checkout code
-        uses: actions/checkout@v4  
+        uses: actions/checkout@v3  
 
       # Set up Docker
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v2
 
       # Set up Docker cache 
       - name: Cache Docker layers
@@ -36,7 +30,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-buildx-
 
-      # Install dependencies and run tests
+      # Install dependencies and run tests (security analysis)
       - name: Install Dependencies and run tests
         run: |
           npm install
@@ -114,14 +108,14 @@ jobs:
         run: |
             IMAGE_TAG="${{ github.sha }}"
             echo "Building Docker image with tag: $IMAGE_TAG"  
-            docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:$IMAGE_TAG .
+            docker build -t fclone29/react-demo:$IMAGE_TAG .
 
       # Run Trivy Security scan on Docker image (updated version)
       - name: Scan Docker image with Trivy for vulnerabilities
         id: trivy_scan
         uses: aquasecurity/trivy-action@0.28.0 
         with:
-            image-ref: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+            image-ref: fclone29/react-demo:${{ env.IMAGE_TAG }}
             format: 'json'  
             exit-code: '0'
             ignore-unfixed: false
@@ -200,150 +194,22 @@ jobs:
             echo "✅ SECURITY GATE PASSED: Safe to proceed with deployment"
           fi
 
-      # Authenticate to Google Cloud (only if security gates pass)
-      - name: Authenticate to Google Cloud
+      # Log in to Docker Hub (only if security gates pass)
+      - name: Log in to Docker Hub
         if: success()
-        uses: google-github-actions/auth@v2
+        uses: docker/login-action@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Set up Cloud SDK
-      - name: Set up Cloud SDK
-        if: success()
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      # Configure Docker to use gcloud as credential helper
-      - name: Configure Docker for Artifact Registry
+      # Push Docker image to Docker Hub or GitHub Container Registry (only if security gates pass)
+      - name: Push Docker image to Registry
         if: success()
         run: |
-          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+            echo "Pushing Docker image: fclone29/react-demo:${{ env.IMAGE_TAG }}"  # Verify tag before pushing
+            docker push fclone29/react-demo:${{ env.IMAGE_TAG }}
 
-      # Push Docker image to Google Artifact Registry (only if security gates pass)
-      - name: Push Docker image to Artifact Registry
-        if: success()
-        run: |
-            echo "Pushing Docker image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}"
-            docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
-            
-            # Also tag and push as latest
-            docker tag ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} \
-              ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
-            docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
-
-      # Deploy to Cloud Run (only if security gates pass)
-      - name: Deploy to Cloud Run
-        if: success()
-        run: |
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} \
-            --region=${{ env.REGION }} \
-            --platform=managed \
-            --allow-unauthenticated \
-            --port=3000 \
-            --memory=512Mi \
-            --cpu=1 \
-            --concurrency=80 \
-            --max-instances=10 \
-            --min-instances=0 \
-            --timeout=300 \
-            --set-env-vars="NODE_ENV=production" \
-            --labels="environment=production,version=${{ env.IMAGE_TAG }},deployed-by=github-actions" \
-            --revision-suffix="${{ env.IMAGE_TAG }}" \
-            --tag="v${{ env.IMAGE_TAG }}" \
-            --no-traffic \
-            --quiet
-
-      # Traffic Migration with Gradual Rollout
-      - name: Gradual Traffic Migration
-        if: success()
-        run: |
-          # Get current serving revision
-          CURRENT_REVISION=$(gcloud run revisions list \
-            --service=${{ env.SERVICE_NAME }} \
-            --region=${{ env.REGION }} \
-            --format="value(metadata.name)" \
-            --filter="status.conditions.type:Ready AND status.conditions.status:True AND spec.template.metadata.labels.serving.knative.dev/service=${{ env.SERVICE_NAME }}" \
-            --limit=1 | head -n 1)
-          
-          NEW_REVISION="${{ env.SERVICE_NAME }}-${{ env.IMAGE_TAG }}"
-          
-          echo "Current revision: $CURRENT_REVISION"
-          echo "New revision: $NEW_REVISION"
-          
-          # Deploy with 10% traffic initially for canary testing
-          if [ -n "$CURRENT_REVISION" ] && [ "$CURRENT_REVISION" != "$NEW_REVISION" ]; then
-            echo "Performing canary deployment: 10% new, 90% current"
-            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
-              --region=${{ env.REGION }} \
-              --to-revisions="$NEW_REVISION=10,$CURRENT_REVISION=90"
-            
-            # Wait for 2 minutes for monitoring
-            echo "Waiting 2 minutes for canary monitoring..."
-            sleep 120
-            
-            # If no issues, move 50% traffic
-            echo "Moving 50% traffic to new revision"
-            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
-              --region=${{ env.REGION }} \
-              --to-revisions="$NEW_REVISION=50,$CURRENT_REVISION=50"
-            
-            # Wait another 2 minutes
-            echo "Waiting 2 minutes before full deployment..."
-            sleep 120
-            
-            # Full traffic migration
-            echo "Moving 100% traffic to new revision"
-            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
-              --region=${{ env.REGION }} \
-              --to-revisions="$NEW_REVISION=100"
-          else
-            echo "First deployment or same revision, routing 100% traffic"
-            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
-              --region=${{ env.REGION }} \
-              --to-revisions="$NEW_REVISION=100"
-          fi
-
-      # Get Cloud Run service URL
-      - name: Get Service URL
-        if: success()
-        run: |
-          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
-            --region=${{ env.REGION }} \
-            --format="value(status.url)")
-          echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
-          echo "Service deployed at: $SERVICE_URL"
-
-      # Health Check
-      - name: Health Check
-        if: success()
-        run: |
-          echo "Performing health check on ${{ env.SERVICE_URL }}"
-          
-          # Wait for service to be ready
-          sleep 30
-          
-          # Perform health check with retry
-          for i in {1..5}; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.SERVICE_URL }} || echo "000")
-            
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Health check passed (HTTP $HTTP_CODE)"
-              echo "HEALTH_CHECK_STATUS=✅ Healthy" >> $GITHUB_ENV
-              break
-            else
-              echo "⚠️ Health check attempt $i failed (HTTP $HTTP_CODE)"
-              if [ $i -eq 5 ]; then
-                echo "HEALTH_CHECK_STATUS=❌ Unhealthy" >> $GITHUB_ENV
-                echo "❌ Health check failed after 5 attempts"
-                exit 1
-              fi
-              sleep 10
-            fi
-          done
-
-      # Notify via Slack on Success
+      # Notify via Slack on Success (with Security Scan Results)
       - name: Notify via Slack on Success
         if: success()
         uses: slackapi/slack-github-action@v2.1.1 
@@ -351,26 +217,22 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK }}
           webhook-type: incoming-webhook
           payload: |
-            text: "GCP Deployment successful for commit ${{ github.sha }}"
+            text: "Deployment successful for commit ${{ github.sha }}"
             blocks:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "*🎉 GCP Deployment Successful*"
+                  text: "*🎉 Deployment Successful*"
               - type: "section"
                 fields:
                   - type: "mrkdwn"
                     text: "*Commit SHA*: ${{ github.sha }}"
                   - type: "mrkdwn"
                     text: "*Image Tag*: ${{ env.IMAGE_TAG }}"
-                  - type: "mrkdwn"
-                    text: "*Service URL*: ${{ env.SERVICE_URL }}"
-                  - type: "mrkdwn"
-                    text: "*Region*: ${{ env.REGION }}"
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "<${{ env.SERVICE_URL }}|🚀 Open Application> | <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|View Commit>"
+                  text: "<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|View Commit>"
               - type: "divider"
               - type: "section"
                 text:
@@ -382,14 +244,8 @@ jobs:
                     text: "*Snyk Dependencies*\n${{ env.SNYK_STATUS }}\nTotal: ${{ env.SNYK_TOTAL }} (Critical: ${{ env.SNYK_CRITICAL }}, High: ${{ env.SNYK_HIGH }}, Medium: ${{ env.SNYK_MEDIUM }}, Low: ${{ env.SNYK_LOW }})"
                   - type: "mrkdwn"
                     text: "*Trivy Container*\n${{ env.TRIVY_STATUS }}\nTotal: ${{ env.TRIVY_TOTAL }} (Critical: ${{ env.TRIVY_CRITICAL }}, High: ${{ env.TRIVY_HIGH }}, Medium: ${{ env.TRIVY_MEDIUM }}, Low: ${{ env.TRIVY_LOW }})"
-              - type: "section"
-                fields:
-                  - type: "mrkdwn"
-                    text: "*Health Check*\n${{ env.HEALTH_CHECK_STATUS }}"
-                  - type: "mrkdwn"
-                    text: "*Traffic*\n100% to new revision"
 
-      # Notify via Slack on Failure
+      # Notify via Slack on Failure (with Security Scan Results)
       - name: Notify via Slack on Failure
         if: failure()
         uses: slackapi/slack-github-action@v2.1.1  
@@ -397,12 +253,12 @@ jobs:
           webhook: ${{ secrets.SLACK_WEBHOOK }}
           webhook-type: incoming-webhook
           payload: |
-            text: "GCP Deployment failed for commit ${{ github.sha }}"
+            text: "Deployment failed for commit ${{ github.sha }}"
             blocks:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "*❌ GCP Deployment Failed*"
+                  text: "*❌ Deployment Failed*"
               - type: "section"
                 fields:
                   - type: "mrkdwn"
@@ -412,7 +268,7 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|View Commit> | <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                  text: "<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|View Commit>"
               - type: "divider"
               - type: "section"
                 text:
@@ -442,7 +298,7 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "*🚨 SECURITY ALERT - GCP DEPLOYMENT BLOCKED*"
+                  text: "*🚨 SECURITY ALERT - DEPLOYMENT BLOCKED*"
               - type: "section"
                 text:
                   type: "mrkdwn"
@@ -460,4 +316,4 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "🛑 *GCP DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding."
+                  text: "🛑 *DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding."
