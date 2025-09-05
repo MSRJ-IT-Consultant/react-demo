@@ -13,7 +13,6 @@ env:
   REGION: asia-southeast1
   SERVICE_NAME: react-demo-app
   REPOSITORY: sb-repository
-  CUSTOM_DOMAIN: apps.muhammad-syamsurrijal.my.id
   
 jobs:
   build:
