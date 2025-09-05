@@ -249,7 +249,7 @@ jobs:
 
       # Push Docker image to Google Artifact Registry (only if security gates pass)
       - name: Push Docker image to Artifact Registry
-        if: success()
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
             echo "Pushing Docker image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}"
             docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
@@ -296,7 +296,7 @@ jobs:
     name: Deploy to GCP
     runs-on: ubuntu-latest
     needs: security-scan
-    if: success()
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
     environment: production
     
     steps:
