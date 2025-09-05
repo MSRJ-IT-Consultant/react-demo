@@ -251,8 +251,6 @@ jobs:
             --set-env-vars="NODE_ENV=production" \
             --labels="environment=production,version=${{ env.IMAGE_TAG }},deployed-by=github-actions" \
             --revision-suffix="${{ env.IMAGE_TAG }}" \
-            --tag="v${{ env.IMAGE_TAG }}" \
-            --no-traffic \
             --quiet
 
       # Traffic Migration with Gradual Rollout
