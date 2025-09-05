@@ -203,7 +203,7 @@ jobs:
 
       # Generate SBOM
       - name: Generate SBOM (Syft)
-        uses: anchore/syft-action@v0.15.0
+        uses: anchore/sbom-action@v0
         with:
           image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
           format: cyclonedx-json
