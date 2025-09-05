@@ -18,7 +18,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       # Checkout source code
       - name: Checkout code
@@ -201,14 +200,6 @@ jobs:
             echo "✅ SECURITY GATE PASSED: Safe to proceed with deployment"
           fi
 
-      # Generate SBOM
-      - name: Generate SBOM (Syft)
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
-          format: cyclonedx-json
-          output: sbom.json
-
       # Upload scan artifacts for audit trail
       - name: Upload All Scan Results
         if: always()
@@ -219,8 +210,11 @@ jobs:
             snyk-results.json
             trivy-results.json
             audit-results.json
-            sbom.json
 
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
       # Authenticate to Google Cloud (only if security gates pass)
       - name: Authenticate to Google Cloud
         if: success()
@@ -312,6 +306,10 @@ jobs:
             fi
           done
 
+  send-notification:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
       # Notify via Slack on Success
       - name: Notify via Slack on Success
         if: success()
@@ -430,3 +428,4 @@ jobs:
                 text:
                   type: "mrkdwn"
                   text: "🛑 *GCP DEPLOYMENT STOPPED:* Pipeline has been blocked due to security vulnerabilities. Please fix these issues before proceeding."
+
