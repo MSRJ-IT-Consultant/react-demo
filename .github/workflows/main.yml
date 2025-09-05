@@ -298,8 +298,7 @@ jobs:
         run: |
           gcloud run domain-mappings create \
             --service=${{ env.SERVICE_NAME }} \
-            --domain=${{ env.CUSTOM_DOMAIN }} \
-            --region=${{ env.REGION }} || echo "Domain already mapped, skipping..."
+            --domain=${{ env.CUSTOM_DOMAIN }} || echo "Domain already mapped, skipping..."
 
 
       # Notify via Slack on Success
