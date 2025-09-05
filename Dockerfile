@@ -12,7 +12,7 @@ RUN npm run build
 FROM nginx:alpine
 
 # Copy built app
-COPY --from=builder /app/build /usr/share/nginx/html
+COPY --from=builder /app/dist /usr/share/nginx/html
 
 # Copy nginx config untuk SPA
 COPY nginx.conf /etc/nginx/nginx.conf
