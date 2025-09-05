@@ -57,6 +57,12 @@ jobs:
           npm install
           npm audit --production --json | tee audit-results.json
 
+      - name: Run Linter
+        run: npm run lint
+    
+      - name: Run Tests
+        run: npm test
+
       # Run Snyk Security scan on dependencies
       - name: Run Snyk to check for vulnerabilities
         id: snyk_scan
